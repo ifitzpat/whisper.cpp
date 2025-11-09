@@ -225,7 +225,7 @@ whisper.cpp/
 - Or manually create boilerplate following GStreamer Plugin Writer's Guide
 - Implement class_init, init, finalize functions
 
-#### Step 1.3: Property Registration
+#### Step 1.3: Property and Signal Registration
 Register all properties using g_object_class_install_property():
 ```c
 // In class_init()
@@ -240,6 +240,18 @@ g_object_class_install_property(gobject_class, PROP_LANGUAGE,
         "auto", G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
 // ... (continue for all properties)
+```
+
+Register all signals using g_signal_new():
+```c
+// Signal registration (see "GObject Signals" section for complete implementation)
+gst_whisper_transcribe_signals[SIGNAL_MODEL_LOADED] =
+    g_signal_new("model-loaded", G_TYPE_FROM_CLASS(klass), ...);
+
+gst_whisper_transcribe_signals[SIGNAL_SEGMENT_TRANSCRIBED] =
+    g_signal_new("segment-transcribed", G_TYPE_FROM_CLASS(klass), ...);
+
+// ... (register all 10 signals - see API section for details)
 ```
 
 #### Step 1.4: Pad Template Definition
@@ -650,6 +662,10 @@ gboolean perform_sliding_window_transcription(
     gint64 pts,
     GError **error
 ) {
+    // Emit transcription-started signal
+    gint64 start_time = g_get_monotonic_time() * 1000;  // Convert to nanoseconds
+    emit_transcription_lifecycle_signals(filter, pts, TRUE);
+
     struct whisper_full_params wparams =
         whisper_full_default_params(filter->sampling_strategy);
 
@@ -679,6 +695,11 @@ gboolean perform_sliding_window_transcription(
         return FALSE;
     }
 
+    // Emit language detection signal if auto-detect is enabled
+    if (filter->detect_language) {
+        emit_language_detected_signal(filter, filter->whisper_ctx->ctx);
+    }
+
     // Extract initial segments
     RefinementManager *refiner = refinement_manager_new();
     gint n_segments = whisper_full_n_segments(filter->whisper_ctx->ctx);
@@ -704,9 +725,31 @@ gboolean perform_sliding_window_transcription(
         }
     }
 
-    // Extract best transcription
+    // Extract best transcription and emit segment signal
     gfloat confidence = 0.0;
     gchar *final_text = refinement_manager_get_best_transcription(refiner, &confidence);
+
+    // Get language for segment signal
+    gint lang_id = whisper_full_lang_id(filter->whisper_ctx->ctx);
+    const gchar *language = whisper_lang_str(lang_id);
+
+    // Calculate timestamps
+    gint64 duration_ns = (n_samples * GST_SECOND) / WHISPER_SAMPLE_RATE;
+    gint64 end_time_ns = pts + duration_ns;
+
+    // Emit segment-transcribed signal with detailed data
+    if (n_segments > 0) {
+        emit_segment_transcribed_signal(
+            filter,
+            final_text,
+            pts,
+            end_time_ns,
+            confidence,
+            language,
+            filter->whisper_ctx->ctx,
+            n_segments - 1  // Last segment
+        );
+    }
 
     // Create and push JSON output
     push_transcription_output(filter, final_text, pts, n_samples, confidence);
@@ -716,6 +759,13 @@ gboolean perform_sliding_window_transcription(
 
     g_free(final_text);
     refinement_manager_free(refiner);
+
+    // Emit transcription-completed signal
+    gint64 end_time = g_get_monotonic_time() * 1000;
+    gint64 processing_duration = end_time - start_time;
+    g_signal_emit(filter,
+        gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_COMPLETED],
+        0, pts, processing_duration);
 
     return TRUE;
 }
@@ -1353,6 +1403,718 @@ static GstStateChangeReturn gst_whisper_transcribe_change_state(
 | `window-duration` | int | 10000 | Sliding window duration (ms) |
 | `step-duration` | int | 3000 | Step between windows (ms) |
 | `overlap-duration` | int | 200 | Overlap between windows (ms) |
+
+### GObject Signals
+
+The element emits various signals to notify applications of important events during model lifecycle and transcription.
+
+#### Signal Definitions
+
+| Signal | Arguments | Description |
+|--------|-----------|-------------|
+| `model-loaded` | `model-path` (string) | Emitted when model is successfully loaded |
+| `model-unloaded` | - | Emitted when model is unloaded |
+| `model-load-failed` | `error-message` (string) | Emitted when model loading fails |
+| `segment-transcribed` | `segment-data` (GstStructure) | Emitted for each transcribed segment |
+| `language-detected` | `language` (string), `probability` (float) | Emitted when language is auto-detected |
+| `transcription-started` | `timestamp` (int64) | Emitted when window transcription begins |
+| `transcription-completed` | `timestamp` (int64), `duration` (int64) | Emitted when window transcription finishes |
+| `vad-speech-detected` | `timestamp` (int64), `is-speech` (boolean) | Emitted on VAD state changes |
+| `buffer-overflow` | `dropped-samples` (uint64) | Warning when audio buffer overflows |
+| `model-info` | `info` (GstStructure) | Emitted after model load with model details |
+
+#### Signal Registration
+
+```c
+enum {
+    SIGNAL_MODEL_LOADED,
+    SIGNAL_MODEL_UNLOADED,
+    SIGNAL_MODEL_LOAD_FAILED,
+    SIGNAL_SEGMENT_TRANSCRIBED,
+    SIGNAL_LANGUAGE_DETECTED,
+    SIGNAL_TRANSCRIPTION_STARTED,
+    SIGNAL_TRANSCRIPTION_COMPLETED,
+    SIGNAL_VAD_SPEECH_DETECTED,
+    SIGNAL_BUFFER_OVERFLOW,
+    SIGNAL_MODEL_INFO,
+    LAST_SIGNAL
+};
+
+static guint gst_whisper_transcribe_signals[LAST_SIGNAL] = { 0 };
+
+// In class_init():
+static void gst_whisper_transcribe_class_init(GstWhisperTranscribeClass *klass) {
+    GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
+
+    // ... (property registration)
+
+    /**
+     * GstWhisperTranscribe::model-loaded:
+     * @whispertranscribe: the whispertranscribe instance
+     * @model_path: path to the loaded model file
+     *
+     * Emitted when a model has been successfully loaded.
+     */
+    gst_whisper_transcribe_signals[SIGNAL_MODEL_LOADED] =
+        g_signal_new("model-loaded",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            0,
+            NULL, NULL,
+            NULL,
+            G_TYPE_NONE,
+            1, G_TYPE_STRING);
+
+    /**
+     * GstWhisperTranscribe::model-unloaded:
+     * @whispertranscribe: the whispertranscribe instance
+     *
+     * Emitted when a model has been unloaded.
+     */
+    gst_whisper_transcribe_signals[SIGNAL_MODEL_UNLOADED] =
+        g_signal_new("model-unloaded",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            0,
+            NULL, NULL,
+            NULL,
+            G_TYPE_NONE,
+            0);
+
+    /**
+     * GstWhisperTranscribe::model-load-failed:
+     * @whispertranscribe: the whispertranscribe instance
+     * @error_message: description of the error
+     *
+     * Emitted when model loading fails.
+     */
+    gst_whisper_transcribe_signals[SIGNAL_MODEL_LOAD_FAILED] =
+        g_signal_new("model-load-failed",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            0,
+            NULL, NULL,
+            NULL,
+            G_TYPE_NONE,
+            1, G_TYPE_STRING);
+
+    /**
+     * GstWhisperTranscribe::segment-transcribed:
+     * @whispertranscribe: the whispertranscribe instance
+     * @segment_data: GstStructure containing segment information
+     *
+     * Emitted for each transcribed segment. The structure contains:
+     * - text (string): transcribed text
+     * - start-time (int64): start timestamp in nanoseconds
+     * - end-time (int64): end timestamp in nanoseconds
+     * - confidence (double): average confidence score
+     * - language (string): detected language
+     * - tokens (GstValueArray): array of token structures
+     */
+    gst_whisper_transcribe_signals[SIGNAL_SEGMENT_TRANSCRIBED] =
+        g_signal_new("segment-transcribed",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            0,
+            NULL, NULL,
+            NULL,
+            G_TYPE_NONE,
+            1, GST_TYPE_STRUCTURE);
+
+    /**
+     * GstWhisperTranscribe::language-detected:
+     * @whispertranscribe: the whispertranscribe instance
+     * @language: detected language code (e.g., "en", "fr")
+     * @probability: detection confidence (0.0 - 1.0)
+     *
+     * Emitted when language auto-detection completes.
+     */
+    gst_whisper_transcribe_signals[SIGNAL_LANGUAGE_DETECTED] =
+        g_signal_new("language-detected",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            0,
+            NULL, NULL,
+            NULL,
+            G_TYPE_NONE,
+            2, G_TYPE_STRING, G_TYPE_FLOAT);
+
+    /**
+     * GstWhisperTranscribe::transcription-started:
+     * @whispertranscribe: the whispertranscribe instance
+     * @timestamp: start timestamp in nanoseconds
+     *
+     * Emitted when transcription of a new window begins.
+     */
+    gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_STARTED] =
+        g_signal_new("transcription-started",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            0,
+            NULL, NULL,
+            NULL,
+            G_TYPE_NONE,
+            1, G_TYPE_INT64);
+
+    /**
+     * GstWhisperTranscribe::transcription-completed:
+     * @whispertranscribe: the whispertranscribe instance
+     * @timestamp: start timestamp in nanoseconds
+     * @duration: processing duration in nanoseconds
+     *
+     * Emitted when transcription of a window completes.
+     */
+    gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_COMPLETED] =
+        g_signal_new("transcription-completed",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            0,
+            NULL, NULL,
+            NULL,
+            G_TYPE_NONE,
+            2, G_TYPE_INT64, G_TYPE_INT64);
+
+    /**
+     * GstWhisperTranscribe::vad-speech-detected:
+     * @whispertranscribe: the whispertranscribe instance
+     * @timestamp: timestamp in nanoseconds
+     * @is_speech: TRUE if speech detected, FALSE if silence
+     *
+     * Emitted when Voice Activity Detection state changes.
+     */
+    gst_whisper_transcribe_signals[SIGNAL_VAD_SPEECH_DETECTED] =
+        g_signal_new("vad-speech-detected",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            0,
+            NULL, NULL,
+            NULL,
+            G_TYPE_NONE,
+            2, G_TYPE_INT64, G_TYPE_BOOLEAN);
+
+    /**
+     * GstWhisperTranscribe::buffer-overflow:
+     * @whispertranscribe: the whispertranscribe instance
+     * @dropped_samples: number of audio samples dropped
+     *
+     * Warning emitted when internal audio buffer overflows.
+     */
+    gst_whisper_transcribe_signals[SIGNAL_BUFFER_OVERFLOW] =
+        g_signal_new("buffer-overflow",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            0,
+            NULL, NULL,
+            NULL,
+            G_TYPE_NONE,
+            1, G_TYPE_UINT64);
+
+    /**
+     * GstWhisperTranscribe::model-info:
+     * @whispertranscribe: the whispertranscribe instance
+     * @info: GstStructure containing model information
+     *
+     * Emitted after model is loaded with details. Structure contains:
+     * - model-type (string): e.g., "base.en", "small", "large"
+     * - is-multilingual (boolean): supports multiple languages
+     * - sample-rate (int): required sample rate (16000)
+     * - n-vocab (int): vocabulary size
+     * - gpu-enabled (boolean): whether GPU acceleration is active
+     */
+    gst_whisper_transcribe_signals[SIGNAL_MODEL_INFO] =
+        g_signal_new("model-info",
+            G_TYPE_FROM_CLASS(klass),
+            G_SIGNAL_RUN_LAST,
+            0,
+            NULL, NULL,
+            NULL,
+            G_TYPE_NONE,
+            1, GST_TYPE_STRUCTURE);
+}
+```
+
+#### Emitting Signals - Implementation Examples
+
+##### Model Loading Signals
+
+```c
+static void emit_model_loaded_signal(
+    GstWhisperTranscribe *filter,
+    const gchar *model_path
+) {
+    g_signal_emit(filter,
+        gst_whisper_transcribe_signals[SIGNAL_MODEL_LOADED],
+        0, model_path);
+
+    // Also emit model info
+    GstStructure *info = gst_structure_new("model-info",
+        "model-type", G_TYPE_STRING,
+            whisper_model_type_readable(filter->whisper_ctx->ctx),
+        "is-multilingual", G_TYPE_BOOLEAN,
+            whisper_is_multilingual(filter->whisper_ctx->ctx),
+        "sample-rate", G_TYPE_INT, WHISPER_SAMPLE_RATE,
+        "n-vocab", G_TYPE_INT,
+            whisper_n_vocab(filter->whisper_ctx->ctx),
+        "gpu-enabled", G_TYPE_BOOLEAN, filter->use_gpu,
+        NULL);
+
+    g_signal_emit(filter,
+        gst_whisper_transcribe_signals[SIGNAL_MODEL_INFO],
+        0, info);
+
+    gst_structure_free(info);
+
+    GST_INFO_OBJECT(filter, "Model loaded: %s", model_path);
+}
+
+// Updated model loading function
+gboolean whisper_context_manager_load_model(
+    WhisperContextManager *mgr,
+    const gchar *model_path,
+    gboolean use_gpu,
+    GstWhisperTranscribe *filter,  // Add filter parameter
+    GError **error
+) {
+    g_mutex_lock(&mgr->mutex);
+
+    // ... (existing loading code)
+
+    if (!mgr->ctx) {
+        g_set_error(error, GST_STREAM_ERROR, GST_STREAM_ERROR_FAILED,
+            "Failed to load whisper model from: %s", model_path);
+        g_mutex_unlock(&mgr->mutex);
+
+        // Emit failure signal
+        g_signal_emit(filter,
+            gst_whisper_transcribe_signals[SIGNAL_MODEL_LOAD_FAILED],
+            0, error ? (*error)->message : "Unknown error");
+
+        return FALSE;
+    }
+
+    g_free(mgr->model_path);
+    mgr->model_path = g_strdup(model_path);
+    mgr->is_loaded = TRUE;
+
+    g_mutex_unlock(&mgr->mutex);
+
+    // Emit success signal
+    emit_model_loaded_signal(filter, model_path);
+
+    return TRUE;
+}
+
+void whisper_context_manager_unload(
+    WhisperContextManager *mgr,
+    GstWhisperTranscribe *filter
+) {
+    g_mutex_lock(&mgr->mutex);
+
+    if (mgr->ctx) {
+        whisper_free(mgr->ctx);
+        mgr->ctx = NULL;
+        mgr->is_loaded = FALSE;
+
+        g_signal_emit(filter,
+            gst_whisper_transcribe_signals[SIGNAL_MODEL_UNLOADED],
+            0);
+
+        GST_INFO_OBJECT(filter, "Model unloaded");
+    }
+
+    g_mutex_unlock(&mgr->mutex);
+}
+```
+
+##### Transcription Signals
+
+```c
+static void emit_segment_transcribed_signal(
+    GstWhisperTranscribe *filter,
+    const gchar *text,
+    gint64 start_time_ns,
+    gint64 end_time_ns,
+    gfloat confidence,
+    const gchar *language,
+    struct whisper_context *ctx,
+    gint segment_idx
+) {
+    // Build structure with segment data
+    GstStructure *segment_data = gst_structure_new("segment",
+        "text", G_TYPE_STRING, text,
+        "start-time", G_TYPE_INT64, start_time_ns,
+        "end-time", G_TYPE_INT64, end_time_ns,
+        "confidence", G_TYPE_DOUBLE, (gdouble)confidence,
+        "language", G_TYPE_STRING, language,
+        NULL);
+
+    // Add token array
+    GValue tokens_array = G_VALUE_INIT;
+    g_value_init(&tokens_array, GST_TYPE_ARRAY);
+
+    gint n_tokens = whisper_full_n_tokens(ctx, segment_idx);
+    for (gint i = 0; i < n_tokens; i++) {
+        struct whisper_token_data token_data =
+            whisper_full_get_token_data(ctx, segment_idx, i);
+        const gchar *token_text =
+            whisper_full_get_token_text(ctx, segment_idx, i);
+
+        GstStructure *token_struct = gst_structure_new("token",
+            "text", G_TYPE_STRING, token_text,
+            "probability", G_TYPE_DOUBLE, (gdouble)token_data.p,
+            "start-time", G_TYPE_INT64, token_data.t0 * 10 * GST_MSECOND,
+            "end-time", G_TYPE_INT64, token_data.t1 * 10 * GST_MSECOND,
+            NULL);
+
+        GValue token_value = G_VALUE_INIT;
+        g_value_init(&token_value, GST_TYPE_STRUCTURE);
+        gst_value_set_structure(&token_value, token_struct);
+        gst_value_array_append_value(&tokens_array, &token_value);
+        g_value_unset(&token_value);
+        gst_structure_free(token_struct);
+    }
+
+    gst_structure_take_value(segment_data, "tokens", &tokens_array);
+
+    // Emit signal
+    g_signal_emit(filter,
+        gst_whisper_transcribe_signals[SIGNAL_SEGMENT_TRANSCRIBED],
+        0, segment_data);
+
+    gst_structure_free(segment_data);
+}
+
+static void emit_transcription_lifecycle_signals(
+    GstWhisperTranscribe *filter,
+    gint64 start_timestamp_ns,
+    gboolean is_starting
+) {
+    if (is_starting) {
+        g_signal_emit(filter,
+            gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_STARTED],
+            0, start_timestamp_ns);
+    } else {
+        gint64 end_time = g_get_monotonic_time() * 1000;  // Convert to ns
+        gint64 duration = end_time - start_timestamp_ns;
+
+        g_signal_emit(filter,
+            gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_COMPLETED],
+            0, start_timestamp_ns, duration);
+    }
+}
+```
+
+##### Language Detection Signal
+
+```c
+static void emit_language_detected_signal(
+    GstWhisperTranscribe *filter,
+    struct whisper_context *ctx
+) {
+    // Auto-detect language
+    gfloat *lang_probs = g_malloc0((whisper_lang_max_id() + 1) * sizeof(gfloat));
+
+    whisper_lang_auto_detect(ctx, 0, filter->n_threads, lang_probs);
+
+    // Find most probable language
+    gint best_lang_id = 0;
+    gfloat best_prob = 0.0f;
+
+    for (gint i = 0; i <= whisper_lang_max_id(); i++) {
+        if (lang_probs[i] > best_prob) {
+            best_prob = lang_probs[i];
+            best_lang_id = i;
+        }
+    }
+
+    const gchar *detected_lang = whisper_lang_str(best_lang_id);
+
+    g_signal_emit(filter,
+        gst_whisper_transcribe_signals[SIGNAL_LANGUAGE_DETECTED],
+        0, detected_lang, best_prob);
+
+    GST_INFO_OBJECT(filter, "Language detected: %s (%.2f%%)",
+        detected_lang, best_prob * 100.0f);
+
+    g_free(lang_probs);
+}
+```
+
+##### VAD and Buffer Signals
+
+```c
+static void emit_vad_signal(
+    GstWhisperTranscribe *filter,
+    gint64 timestamp_ns,
+    gboolean is_speech
+) {
+    g_signal_emit(filter,
+        gst_whisper_transcribe_signals[SIGNAL_VAD_SPEECH_DETECTED],
+        0, timestamp_ns, is_speech);
+}
+
+static void emit_buffer_overflow_warning(
+    GstWhisperTranscribe *filter,
+    guint64 dropped_samples
+) {
+    g_signal_emit(filter,
+        gst_whisper_transcribe_signals[SIGNAL_BUFFER_OVERFLOW],
+        0, dropped_samples);
+
+    GST_WARNING_OBJECT(filter,
+        "Audio buffer overflow! Dropped %" G_GUINT64_FORMAT " samples. "
+        "Consider increasing window-duration or reducing step-duration.",
+        dropped_samples);
+}
+```
+
+#### Signal Usage - Application Examples
+
+##### Example 1: Monitoring Model Loading
+
+```c
+static void on_model_loaded(GstElement *element, const gchar *model_path, gpointer user_data) {
+    g_print("✓ Model loaded successfully: %s\n", model_path);
+}
+
+static void on_model_load_failed(GstElement *element, const gchar *error_msg, gpointer user_data) {
+    g_printerr("✗ Model loading failed: %s\n", error_msg);
+    // Handle error - maybe try alternative model
+}
+
+static void on_model_info(GstElement *element, GstStructure *info, gpointer user_data) {
+    const gchar *model_type = gst_structure_get_string(info, "model-type");
+    gboolean is_multilingual = FALSE;
+    gboolean gpu_enabled = FALSE;
+
+    gst_structure_get_boolean(info, "is-multilingual", &is_multilingual);
+    gst_structure_get_boolean(info, "gpu-enabled", &gpu_enabled);
+
+    g_print("Model Info:\n");
+    g_print("  Type: %s\n", model_type);
+    g_print("  Multilingual: %s\n", is_multilingual ? "yes" : "no");
+    g_print("  GPU Acceleration: %s\n", gpu_enabled ? "enabled" : "disabled");
+}
+
+// In application setup:
+GstElement *whisper = gst_element_factory_make("whispertranscribe", "transcriber");
+g_object_set(whisper, "model", "/path/to/model.bin", NULL);
+
+g_signal_connect(whisper, "model-loaded", G_CALLBACK(on_model_loaded), NULL);
+g_signal_connect(whisper, "model-load-failed", G_CALLBACK(on_model_load_failed), NULL);
+g_signal_connect(whisper, "model-info", G_CALLBACK(on_model_info), NULL);
+```
+
+##### Example 2: Real-time Transcription Display
+
+```c
+static void on_segment_transcribed(
+    GstElement *element,
+    GstStructure *segment_data,
+    gpointer user_data
+) {
+    const gchar *text = gst_structure_get_string(segment_data, "text");
+    gint64 start_time = 0, end_time = 0;
+    gdouble confidence = 0.0;
+    const gchar *language = NULL;
+
+    gst_structure_get_int64(segment_data, "start-time", &start_time);
+    gst_structure_get_int64(segment_data, "end-time", &end_time);
+    gst_structure_get_double(segment_data, "confidence", &confidence);
+    language = gst_structure_get_string(segment_data, "language");
+
+    g_print("[%02d:%02d.%03d -> %02d:%02d.%03d] [%s] (%.1f%%) %s\n",
+        (gint)(start_time / GST_SECOND / 60),
+        (gint)(start_time / GST_SECOND % 60),
+        (gint)(start_time / GST_MSECOND % 1000),
+        (gint)(end_time / GST_SECOND / 60),
+        (gint)(end_time / GST_SECOND % 60),
+        (gint)(end_time / GST_MSECOND % 1000),
+        language,
+        confidence * 100.0,
+        text);
+
+    // Access token details if needed
+    const GValue *tokens_array = gst_structure_get_value(segment_data, "tokens");
+    if (tokens_array && GST_VALUE_HOLDS_ARRAY(tokens_array)) {
+        guint n_tokens = gst_value_array_get_size(tokens_array);
+        for (guint i = 0; i < n_tokens; i++) {
+            const GValue *token_val = gst_value_array_get_value(tokens_array, i);
+            GstStructure *token = gst_value_get_structure(token_val);
+            // Process individual tokens...
+        }
+    }
+}
+
+g_signal_connect(whisper, "segment-transcribed",
+    G_CALLBACK(on_segment_transcribed), NULL);
+```
+
+##### Example 3: Language Detection
+
+```c
+static void on_language_detected(
+    GstElement *element,
+    const gchar *language,
+    gfloat probability,
+    gpointer user_data
+) {
+    g_print("Detected language: %s (confidence: %.1f%%)\n",
+        language, probability * 100.0f);
+
+    if (probability < 0.5) {
+        g_print("Warning: Low confidence language detection\n");
+    }
+
+    // Optionally update UI or adjust parameters based on language
+}
+
+g_signal_connect(whisper, "language-detected",
+    G_CALLBACK(on_language_detected), NULL);
+```
+
+##### Example 4: Performance Monitoring
+
+```c
+static void on_transcription_started(
+    GstElement *element,
+    gint64 timestamp,
+    gpointer user_data
+) {
+    g_print("⏳ Transcription started at %" GST_TIME_FORMAT "\n",
+        GST_TIME_ARGS(timestamp));
+}
+
+static void on_transcription_completed(
+    GstElement *element,
+    gint64 timestamp,
+    gint64 duration,
+    gpointer user_data
+) {
+    g_print("✓ Transcription completed in %" GST_TIME_FORMAT "\n",
+        GST_TIME_ARGS(duration));
+
+    // Calculate real-time factor
+    gint64 audio_duration = 10 * GST_SECOND;  // Assuming 10s windows
+    gdouble rt_factor = (gdouble)audio_duration / duration;
+    g_print("  Real-time factor: %.2fx\n", rt_factor);
+}
+
+g_signal_connect(whisper, "transcription-started",
+    G_CALLBACK(on_transcription_started), NULL);
+g_signal_connect(whisper, "transcription-completed",
+    G_CALLBACK(on_transcription_completed), NULL);
+```
+
+##### Example 5: VAD-based UI Updates
+
+```c
+static void on_vad_speech_detected(
+    GstElement *element,
+    gint64 timestamp,
+    gboolean is_speech,
+    gpointer user_data
+) {
+    if (is_speech) {
+        g_print("🎤 Speech detected at %" GST_TIME_FORMAT "\n",
+            GST_TIME_ARGS(timestamp));
+        // Update UI: show recording indicator
+    } else {
+        g_print("🔇 Silence at %" GST_TIME_FORMAT "\n",
+            GST_TIME_ARGS(timestamp));
+        // Update UI: hide recording indicator
+    }
+}
+
+g_signal_connect(whisper, "vad-speech-detected",
+    G_CALLBACK(on_vad_speech_detected), NULL);
+```
+
+##### Example 6: Error Handling
+
+```c
+static void on_buffer_overflow(
+    GstElement *element,
+    guint64 dropped_samples,
+    gpointer user_data
+) {
+    g_warning("⚠ Buffer overflow! Dropped %" G_GUINT64_FORMAT " samples (%.2f seconds)",
+        dropped_samples,
+        (gdouble)dropped_samples / WHISPER_SAMPLE_RATE);
+
+    // Take action: pause pipeline, increase buffer size, etc.
+    g_object_set(element, "window-duration", 15000, NULL);  // Increase to 15s
+}
+
+g_signal_connect(whisper, "buffer-overflow",
+    G_CALLBACK(on_buffer_overflow), NULL);
+```
+
+##### Example 7: Complete Application Integration
+
+```c
+typedef struct {
+    GMainLoop *loop;
+    GstElement *pipeline;
+    GstElement *whisper;
+    gchar *output_file;
+    FILE *transcript_fp;
+} AppContext;
+
+static void on_segment_transcribed_to_file(
+    GstElement *element,
+    GstStructure *segment_data,
+    gpointer user_data
+) {
+    AppContext *app = (AppContext *)user_data;
+    const gchar *text = gst_structure_get_string(segment_data, "text");
+    gint64 start_time = 0;
+
+    gst_structure_get_int64(segment_data, "start-time", &start_time);
+
+    // Write to file in SRT format
+    fprintf(app->transcript_fp, "[%" GST_TIME_FORMAT "] %s\n",
+        GST_TIME_ARGS(start_time), text);
+    fflush(app->transcript_fp);
+}
+
+int main(int argc, char *argv[]) {
+    gst_init(&argc, &argv);
+
+    AppContext app = {0};
+    app.loop = g_main_loop_new(NULL, FALSE);
+    app.transcript_fp = fopen("transcript.txt", "w");
+
+    app.pipeline = gst_parse_launch(
+        "pulsesrc ! audioconvert ! "
+        "whispertranscribe name=whisper model=/path/to/model.bin ! "
+        "fakesink",
+        NULL);
+
+    app.whisper = gst_bin_get_by_name(GST_BIN(app.pipeline), "whisper");
+
+    // Connect all signals
+    g_signal_connect(app.whisper, "segment-transcribed",
+        G_CALLBACK(on_segment_transcribed_to_file), &app);
+    g_signal_connect(app.whisper, "model-loaded",
+        G_CALLBACK(on_model_loaded), &app);
+    g_signal_connect(app.whisper, "language-detected",
+        G_CALLBACK(on_language_detected), &app);
+    g_signal_connect(app.whisper, "buffer-overflow",
+        G_CALLBACK(on_buffer_overflow), &app);
+
+    gst_element_set_state(app.pipeline, GST_STATE_PLAYING);
+    g_main_loop_run(app.loop);
+
+    // Cleanup
+    gst_element_set_state(app.pipeline, GST_STATE_NULL);
+    gst_object_unref(app.pipeline);
+    fclose(app.transcript_fp);
+    g_main_loop_unref(app.loop);
+
+    return 0;
+}
+```
 
 ### Control Pad Commands
 
