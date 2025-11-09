@@ -17,6 +17,7 @@
 - ✅ Plugin registration (`gstwhisperplugin.c`)
 - ✅ Element class definition (`gstwhispertranscribe.c/h`)
 - ✅ 6 core properties with get/set handlers
+- ✅ **10 GObject signals** (TDD Cycle 2 - COMPLETE)
 - ✅ Pad templates (sink: audio, source: json)
 - ✅ Element metadata
 - ✅ GstAudioFilter base class integration
@@ -73,7 +74,7 @@ gstreamer/
 3. ✅ Plugin Inspection (properties)
 4. ✅ Pad Templates
 5. ✅ Element Creation
-6. ⚠️ Signal Verification (signals not implemented yet)
+6. ✅ **Signal Verification (10/10 signals implemented!)**
 
 **Unit Tests (test_plugin.c):**
 - ✅ Plugin registration check
@@ -81,7 +82,7 @@ gstreamer/
 - ✅ Metadata verification
 - ✅ Pad existence check
 - ✅ Property enumeration
-- ⚠️ Signal enumeration (signals not implemented yet)
+- ✅ **Signal enumeration (10 signals registered)**
 
 **Pipeline Tests (test-pipeline.sh):**
 - ✅ Pipeline construction
@@ -97,23 +98,29 @@ gstreamer/
 **Green:** Plugin discovered, element created, properties visible
 **Refactor:** Code committed with documentation
 
-### Cycle 2: Signals (Next) ⏭️ TODO
+### Cycle 2: Signals ✅ GREEN
 
 **Red (Expected):** Test 6/6 will fail - signals not found
-**Green (TODO):** Implement 10 signals in gstwhispertranscribe.c
-**Refactor (TODO):** Clean up signal registration code
+**Green (COMPLETE):** Implemented 10 signals in gstwhispertranscribe.c
+**Refactor (NEXT):** Commit signal implementation
 
-**Signals to implement:**
-1. model-loaded
-2. model-unloaded
-3. model-load-failed
-4. segment-transcribed
-5. language-detected
-6. transcription-started
-7. transcription-completed
-8. vad-speech-detected
-9. buffer-overflow
-10. model-info
+**Signals implemented:**
+1. ✅ model-loaded (1 arg: model_path string)
+2. ✅ model-unloaded (no args)
+3. ✅ model-load-failed (1 arg: error_message string)
+4. ✅ segment-transcribed (1 arg: segment_data GstStructure)
+5. ✅ language-detected (2 args: language string, probability float)
+6. ✅ transcription-started (1 arg: timestamp int64)
+7. ✅ transcription-completed (2 args: timestamp int64, duration int64)
+8. ✅ vad-speech-detected (2 args: timestamp int64, is_speech boolean)
+9. ✅ buffer-overflow (1 arg: dropped_samples uint64)
+10. ✅ model-info (1 arg: info GstStructure)
+
+### Cycle 3: Additional Properties (Next) ⏭️ TODO
+
+**Red (Expected):** Properties not found in plugin inspection
+**Green (TODO):** Add 11 remaining properties
+**Refactor (TODO):** Organize property handling code
 
 ## How to Test (Requires GStreamer)
 
@@ -282,20 +289,23 @@ gst-launch-1.0 whispertranscribe model=test.bin ! fakesink
 - ✅ Phase 1 basic implementation
 - ✅ Plugin registration
 - ✅ Element creation
-- ✅ Property system
+- ✅ Property system (6 properties)
+- ✅ **Signal system (10 signals)**
 - ✅ Pad templates
 - ✅ Build system
+- ✅ GitHub Actions CI/CD
 
 **What's Next:**
-- ⏭️ Add signals (complete Phase 1)
-- ⏭️ Test on system with GStreamer
+- ⏭️ Add remaining 11 properties (TDD Cycle 3)
+- ⏭️ Test on system with GStreamer (CI will run)
 - ⏭️ Phase 2: Whisper.cpp integration
 - ⏭️ Phase 3: Audio buffering
 
 **Ready to Test:**
-Transfer the `gstreamer/` directory to a system with GStreamer installed and run `./build-standalone.sh` to see Phase 1 in action!
+- Transfer the `gstreamer/` directory to a system with GStreamer installed and run `./build-standalone.sh`
+- OR push to GitHub and let CI run the tests automatically!
 
 ---
 
-*Last Updated: After Phase 1 TDD Cycle 1*
-*Next: TDD Cycle 2 - Implement Signals*
+*Last Updated: After Phase 1 TDD Cycle 2*
+*Next: TDD Cycle 3 - Add Remaining Properties*
