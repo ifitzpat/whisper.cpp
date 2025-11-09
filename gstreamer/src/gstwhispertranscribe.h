@@ -35,13 +35,32 @@ typedef struct _GstWhisperTranscribeClass GstWhisperTranscribeClass;
 struct _GstWhisperTranscribe {
   GstAudioFilter parent;
 
-  /* Properties - to be implemented in next TDD cycle */
+  /* Basic properties */
   gchar *model_path;
   gchar *language;
   gint n_threads;
   gfloat temperature;
   gboolean use_gpu;
   gboolean enable_vad;
+
+  /* Language and translation properties (TDD Cycle 3) */
+  gboolean translate;
+  gboolean detect_language;
+
+  /* Sampling properties (TDD Cycle 3) */
+  gint sampling_strategy;
+  gint beam_size;
+  gfloat entropy_threshold;
+  gfloat logprob_threshold;
+  gfloat no_speech_threshold;
+
+  /* Context properties (TDD Cycle 3) */
+  gchar *initial_prompt;
+
+  /* Sliding window properties (TDD Cycle 3) */
+  gint window_duration_ms;
+  gint step_duration_ms;
+  gint overlap_duration_ms;
 };
 
 struct _GstWhisperTranscribeClass {

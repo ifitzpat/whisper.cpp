@@ -75,6 +75,18 @@ enum
   PROP_TEMPERATURE,
   PROP_USE_GPU,
   PROP_ENABLE_VAD,
+  /* TDD Cycle 3 - Additional properties */
+  PROP_TRANSLATE,
+  PROP_DETECT_LANGUAGE,
+  PROP_SAMPLING_STRATEGY,
+  PROP_BEAM_SIZE,
+  PROP_ENTROPY_THRESHOLD,
+  PROP_LOGPROB_THRESHOLD,
+  PROP_NO_SPEECH_THRESHOLD,
+  PROP_INITIAL_PROMPT,
+  PROP_WINDOW_DURATION,
+  PROP_STEP_DURATION,
+  PROP_OVERLAP_DURATION,
 };
 
 /* Signal enum */
@@ -142,6 +154,63 @@ gst_whisper_transcribe_class_init (GstWhisperTranscribeClass * klass)
       g_param_spec_boolean ("enable-vad", "Enable VAD",
           "Enable Voice Activity Detection",
           TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /* Additional Properties - TDD Cycle 3 */
+
+  g_object_class_install_property (gobject_class, PROP_TRANSLATE,
+      g_param_spec_boolean ("translate", "Translate",
+          "Translate from source language to English",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_DETECT_LANGUAGE,
+      g_param_spec_boolean ("detect-language", "Detect Language",
+          "Automatically detect the spoken language",
+          TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_SAMPLING_STRATEGY,
+      g_param_spec_int ("sampling-strategy", "Sampling Strategy",
+          "Sampling strategy (0=GREEDY, 1=BEAM_SEARCH)",
+          0, 1, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_BEAM_SIZE,
+      g_param_spec_int ("beam-size", "Beam Size",
+          "Beam size for beam search sampling",
+          1, 10, 5, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_ENTROPY_THRESHOLD,
+      g_param_spec_float ("entropy-threshold", "Entropy Threshold",
+          "Entropy threshold for decoder fallback",
+          0.0, 10.0, 2.4, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_LOGPROB_THRESHOLD,
+      g_param_spec_float ("logprob-threshold", "Log Probability Threshold",
+          "Log probability threshold for decoder fallback",
+          -10.0, 0.0, -1.0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_NO_SPEECH_THRESHOLD,
+      g_param_spec_float ("no-speech-threshold", "No Speech Threshold",
+          "Probability threshold for no-speech detection",
+          0.0, 1.0, 0.6, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_INITIAL_PROMPT,
+      g_param_spec_string ("initial-prompt", "Initial Prompt",
+          "Optional text to provide as context for transcription",
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_WINDOW_DURATION,
+      g_param_spec_int ("window-duration", "Window Duration",
+          "Sliding window duration in milliseconds",
+          1000, 60000, 10000, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_STEP_DURATION,
+      g_param_spec_int ("step-duration", "Step Duration",
+          "Step between windows in milliseconds",
+          100, 30000, 3000, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_OVERLAP_DURATION,
+      g_param_spec_int ("overlap-duration", "Overlap Duration",
+          "Overlap between windows in milliseconds",
+          0, 5000, 200, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /* Signals - Phase 1 TDD Cycle 2 */
 
@@ -354,13 +423,26 @@ gst_whisper_transcribe_class_init (GstWhisperTranscribeClass * klass)
 static void
 gst_whisper_transcribe_init (GstWhisperTranscribe * filter)
 {
-  /* Initialize properties to defaults */
+  /* Initialize basic properties to defaults */
   filter->model_path = NULL;
   filter->language = g_strdup ("auto");
   filter->n_threads = 4;
   filter->temperature = 0.0;
   filter->use_gpu = FALSE;
   filter->enable_vad = TRUE;
+
+  /* Initialize additional properties (TDD Cycle 3) */
+  filter->translate = FALSE;
+  filter->detect_language = TRUE;
+  filter->sampling_strategy = 0;  /* GREEDY */
+  filter->beam_size = 5;
+  filter->entropy_threshold = 2.4;
+  filter->logprob_threshold = -1.0;
+  filter->no_speech_threshold = 0.6;
+  filter->initial_prompt = NULL;
+  filter->window_duration_ms = 10000;  /* 10 seconds */
+  filter->step_duration_ms = 3000;     /* 3 seconds */
+  filter->overlap_duration_ms = 200;   /* 200 ms */
 
   GST_DEBUG_OBJECT (filter, "Initialized whispertranscribe element");
 }
@@ -399,6 +481,51 @@ gst_whisper_transcribe_set_property (GObject * object, guint prop_id,
       filter->enable_vad = g_value_get_boolean (value);
       GST_DEBUG_OBJECT (filter, "Enable VAD set to: %d", filter->enable_vad);
       break;
+    case PROP_TRANSLATE:
+      filter->translate = g_value_get_boolean (value);
+      GST_DEBUG_OBJECT (filter, "Translate set to: %d", filter->translate);
+      break;
+    case PROP_DETECT_LANGUAGE:
+      filter->detect_language = g_value_get_boolean (value);
+      GST_DEBUG_OBJECT (filter, "Detect language set to: %d", filter->detect_language);
+      break;
+    case PROP_SAMPLING_STRATEGY:
+      filter->sampling_strategy = g_value_get_int (value);
+      GST_DEBUG_OBJECT (filter, "Sampling strategy set to: %d", filter->sampling_strategy);
+      break;
+    case PROP_BEAM_SIZE:
+      filter->beam_size = g_value_get_int (value);
+      GST_DEBUG_OBJECT (filter, "Beam size set to: %d", filter->beam_size);
+      break;
+    case PROP_ENTROPY_THRESHOLD:
+      filter->entropy_threshold = g_value_get_float (value);
+      GST_DEBUG_OBJECT (filter, "Entropy threshold set to: %f", filter->entropy_threshold);
+      break;
+    case PROP_LOGPROB_THRESHOLD:
+      filter->logprob_threshold = g_value_get_float (value);
+      GST_DEBUG_OBJECT (filter, "Log prob threshold set to: %f", filter->logprob_threshold);
+      break;
+    case PROP_NO_SPEECH_THRESHOLD:
+      filter->no_speech_threshold = g_value_get_float (value);
+      GST_DEBUG_OBJECT (filter, "No-speech threshold set to: %f", filter->no_speech_threshold);
+      break;
+    case PROP_INITIAL_PROMPT:
+      g_free (filter->initial_prompt);
+      filter->initial_prompt = g_value_dup_string (value);
+      GST_DEBUG_OBJECT (filter, "Initial prompt set to: %s", filter->initial_prompt);
+      break;
+    case PROP_WINDOW_DURATION:
+      filter->window_duration_ms = g_value_get_int (value);
+      GST_DEBUG_OBJECT (filter, "Window duration set to: %d ms", filter->window_duration_ms);
+      break;
+    case PROP_STEP_DURATION:
+      filter->step_duration_ms = g_value_get_int (value);
+      GST_DEBUG_OBJECT (filter, "Step duration set to: %d ms", filter->step_duration_ms);
+      break;
+    case PROP_OVERLAP_DURATION:
+      filter->overlap_duration_ms = g_value_get_int (value);
+      GST_DEBUG_OBJECT (filter, "Overlap duration set to: %d ms", filter->overlap_duration_ms);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -431,6 +558,39 @@ gst_whisper_transcribe_get_property (GObject * object, guint prop_id,
     case PROP_ENABLE_VAD:
       g_value_set_boolean (value, filter->enable_vad);
       break;
+    case PROP_TRANSLATE:
+      g_value_set_boolean (value, filter->translate);
+      break;
+    case PROP_DETECT_LANGUAGE:
+      g_value_set_boolean (value, filter->detect_language);
+      break;
+    case PROP_SAMPLING_STRATEGY:
+      g_value_set_int (value, filter->sampling_strategy);
+      break;
+    case PROP_BEAM_SIZE:
+      g_value_set_int (value, filter->beam_size);
+      break;
+    case PROP_ENTROPY_THRESHOLD:
+      g_value_set_float (value, filter->entropy_threshold);
+      break;
+    case PROP_LOGPROB_THRESHOLD:
+      g_value_set_float (value, filter->logprob_threshold);
+      break;
+    case PROP_NO_SPEECH_THRESHOLD:
+      g_value_set_float (value, filter->no_speech_threshold);
+      break;
+    case PROP_INITIAL_PROMPT:
+      g_value_set_string (value, filter->initial_prompt);
+      break;
+    case PROP_WINDOW_DURATION:
+      g_value_set_int (value, filter->window_duration_ms);
+      break;
+    case PROP_STEP_DURATION:
+      g_value_set_int (value, filter->step_duration_ms);
+      break;
+    case PROP_OVERLAP_DURATION:
+      g_value_set_int (value, filter->overlap_duration_ms);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -445,6 +605,7 @@ gst_whisper_transcribe_finalize (GObject * object)
 
   g_free (filter->model_path);
   g_free (filter->language);
+  g_free (filter->initial_prompt);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
