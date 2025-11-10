@@ -90,6 +90,10 @@ static gboolean gst_whisper_transcribe_setup (GstAudioFilter * filter,
 static GstFlowReturn gst_whisper_transcribe_transform_ip (GstBaseTransform * trans,
     GstBuffer * buf);
 
+/* Phase 9: State management method declarations */
+static gboolean gst_whisper_transcribe_start (GstBaseTransform * trans);
+static gboolean gst_whisper_transcribe_stop (GstBaseTransform * trans);
+
 /* Property enum */
 enum
 {
@@ -436,6 +440,10 @@ gst_whisper_transcribe_class_init (GstWhisperTranscribeClass * klass)
   /* BaseTransform configuration */
   trans_class->transform_ip = GST_DEBUG_FUNCPTR (gst_whisper_transcribe_transform_ip);
   trans_class->passthrough_on_same_caps = FALSE;
+
+  /* Phase 9: State management */
+  trans_class->start = GST_DEBUG_FUNCPTR (gst_whisper_transcribe_start);
+  trans_class->stop = GST_DEBUG_FUNCPTR (gst_whisper_transcribe_stop);
 
   /* AudioFilter configuration */
   audio_filter_class->setup = GST_DEBUG_FUNCPTR (gst_whisper_transcribe_setup);
@@ -1100,6 +1108,50 @@ gst_whisper_transcribe_stop_worker (GstWhisperTranscribe *filter)
   }
 
   GST_INFO_OBJECT (filter, "Worker thread stopped");
+}
+
+/* Phase 9: Start - called when going to PAUSED or PLAYING */
+static gboolean
+gst_whisper_transcribe_start (GstBaseTransform * trans)
+{
+  GstWhisperTranscribe *filter = GST_WHISPER_TRANSCRIBE (trans);
+
+  GST_INFO_OBJECT (filter, "Starting element");
+
+  /* Element is starting - ensure clean state */
+  g_mutex_lock (&filter->lock);
+
+  /* Audio buffer will be created in setup when caps are negotiated */
+  /* Worker thread will be started when model is loaded */
+
+  g_mutex_unlock (&filter->lock);
+
+  GST_INFO_OBJECT (filter, "Element started successfully");
+  return TRUE;
+}
+
+/* Phase 9: Stop - called when going to READY or NULL */
+static gboolean
+gst_whisper_transcribe_stop (GstBaseTransform * trans)
+{
+  GstWhisperTranscribe *filter = GST_WHISPER_TRANSCRIBE (trans);
+
+  GST_INFO_OBJECT (filter, "Stopping element");
+
+  /* Stop worker thread if running */
+  gst_whisper_transcribe_stop_worker (filter);
+
+  /* Clean up audio buffer */
+  g_mutex_lock (&filter->lock);
+  if (filter->audio_buffer) {
+    GST_DEBUG_OBJECT (filter, "Cleaning up audio buffer manager");
+    audio_buffer_manager_free (filter->audio_buffer);
+    filter->audio_buffer = NULL;
+  }
+  g_mutex_unlock (&filter->lock);
+
+  GST_INFO_OBJECT (filter, "Element stopped successfully");
+  return TRUE;
 }
 
 /* Transform in-place - process audio buffers */
