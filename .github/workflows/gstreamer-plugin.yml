@@ -62,7 +62,7 @@ jobs:
           echo "Building whisper.cpp core library with CMake..."
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF
           cmake --build build --config Release -j$(nproc)
-          ls -la build/libwhisper.*
+          ls -la build/src/libwhisper.*
           echo "✓ Core library built successfully"
 
       - name: Configure GStreamer plugin with meson
@@ -71,8 +71,7 @@ jobs:
           echo "Configuring GStreamer plugin..."
           meson setup builddir \
             --prefix=/usr \
-            -Dtests=enabled \
-            -Dwhisper_lib_path=../build
+            -Dtests=enabled
           echo "✓ Configuration complete"
 
       - name: Build GStreamer plugin
@@ -213,7 +212,7 @@ jobs:
       - name: Build GStreamer plugin
         working-directory: gstreamer
         run: |
-          ~/.local/bin/meson setup builddir -Dtests=enabled -Dwhisper_lib_path=../build
+          ~/.local/bin/meson setup builddir -Dtests=enabled
           ~/.local/bin/meson compile -C builddir
 
       - name: Test plugin
