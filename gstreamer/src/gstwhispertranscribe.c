@@ -29,6 +29,7 @@
 #include <gst/gst.h>
 #include <gst/audio/audio.h>
 #include <whisper.h>
+#include <json-glib/json-glib.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_whisper_transcribe_debug);
 #define GST_CAT_DEFAULT gst_whisper_transcribe_debug
@@ -49,6 +50,12 @@ static void gst_whisper_transcribe_stop_worker (GstWhisperTranscribe *filter);
 /* Phase 6: Audio format conversion helpers */
 static gfloat * gst_whisper_transcribe_convert_audio (GstWhisperTranscribe *filter,
     const guint8 *data, gsize size, gsize *out_samples);
+
+/* Phase 8: JSON output helpers */
+static gchar * gst_whisper_transcribe_create_json (GstWhisperTranscribe *filter,
+    struct whisper_context *ctx, gint64 pts);
+static void gst_whisper_transcribe_push_json (GstWhisperTranscribe *filter,
+    const gchar *json_str, gint64 pts);
 
 /* Pad templates - minimal for now */
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE (
@@ -810,6 +817,125 @@ gst_whisper_transcribe_setup (GstAudioFilter * filter,
   return TRUE;
 }
 
+/* Phase 8: Create JSON from transcription results */
+static gchar *
+gst_whisper_transcribe_create_json (GstWhisperTranscribe *filter,
+    struct whisper_context *ctx, gint64 pts)
+{
+  JsonBuilder *builder;
+  JsonGenerator *generator;
+  JsonNode *root;
+  gchar *json_str;
+  gint n_segments;
+  gint i;
+
+  builder = json_builder_new ();
+
+  /* Start root object */
+  json_builder_begin_object (builder);
+
+  /* Add metadata */
+  json_builder_set_member_name (builder, "timestamp");
+  json_builder_add_int_value (builder, pts);
+
+  json_builder_set_member_name (builder, "language");
+  json_builder_add_string_value (builder,
+      filter->language ? filter->language : "auto");
+
+  /* Add segments array */
+  json_builder_set_member_name (builder, "segments");
+  json_builder_begin_array (builder);
+
+  n_segments = whisper_full_n_segments (ctx);
+  for (i = 0; i < n_segments; i++) {
+    const gchar *text = whisper_full_get_segment_text (ctx, i);
+    gint64 t0 = whisper_full_get_segment_t0 (ctx, i);
+    gint64 t1 = whisper_full_get_segment_t1 (ctx, i);
+
+    json_builder_begin_object (builder);
+
+    json_builder_set_member_name (builder, "id");
+    json_builder_add_int_value (builder, i);
+
+    json_builder_set_member_name (builder, "start");
+    json_builder_add_double_value (builder, t0 / 100.0);  /* centiseconds to seconds */
+
+    json_builder_set_member_name (builder, "end");
+    json_builder_add_double_value (builder, t1 / 100.0);
+
+    json_builder_set_member_name (builder, "text");
+    json_builder_add_string_value (builder, text ? text : "");
+
+    json_builder_end_object (builder);
+  }
+
+  json_builder_end_array (builder);  /* segments */
+  json_builder_end_object (builder);  /* root */
+
+  /* Generate JSON string */
+  root = json_builder_get_root (builder);
+  generator = json_generator_new ();
+  json_generator_set_root (generator, root);
+  json_generator_set_pretty (generator, TRUE);
+  json_str = json_generator_to_data (generator, NULL);
+
+  /* Cleanup */
+  json_node_free (root);
+  g_object_unref (generator);
+  g_object_unref (builder);
+
+  return json_str;
+}
+
+/* Phase 8: Push JSON buffer to src pad */
+static void
+gst_whisper_transcribe_push_json (GstWhisperTranscribe *filter,
+    const gchar *json_str, gint64 pts)
+{
+  GstBuffer *buffer;
+  GstMapInfo map;
+  gsize json_len;
+
+  if (!json_str) {
+    GST_WARNING_OBJECT (filter, "NULL JSON string, skipping push");
+    return;
+  }
+
+  json_len = strlen (json_str);
+
+  /* Create buffer */
+  buffer = gst_buffer_new_allocate (NULL, json_len, NULL);
+  if (!buffer) {
+    GST_ERROR_OBJECT (filter, "Failed to allocate buffer for JSON output");
+    return;
+  }
+
+  /* Set buffer metadata */
+  GST_BUFFER_PTS (buffer) = pts;
+  GST_BUFFER_DTS (buffer) = pts;
+  GST_BUFFER_DURATION (buffer) = GST_CLOCK_TIME_NONE;
+
+  /* Copy JSON string to buffer */
+  if (gst_buffer_map (buffer, &map, GST_MAP_WRITE)) {
+    memcpy (map.data, json_str, json_len);
+    gst_buffer_unmap (buffer, &map);
+  } else {
+    GST_ERROR_OBJECT (filter, "Failed to map buffer for writing");
+    gst_buffer_unref (buffer);
+    return;
+  }
+
+  /* Push to src pad */
+  GstFlowReturn ret = gst_pad_push (GST_BASE_TRANSFORM_SRC_PAD (filter), buffer);
+  if (ret != GST_FLOW_OK) {
+    GST_WARNING_OBJECT (filter, "Failed to push JSON buffer: %s",
+        gst_flow_get_name (ret));
+  } else {
+    GST_DEBUG_OBJECT (filter, "Pushed JSON buffer (%zu bytes, PTS: %"
+        GST_TIME_FORMAT ")", json_len, GST_TIME_ARGS (pts));
+  }
+}
+
 /* Phase 5: Worker thread function for async transcription */
 static gpointer
 gst_whisper_transcribe_worker_thread (gpointer data)
@@ -884,6 +1010,14 @@ gst_whisper_transcribe_worker_thread (gpointer data)
               0, segment);
 
           gst_structure_free (segment);
+        }
+
+        /* Phase 8: Create and push JSON output */
+        gchar *json_str = gst_whisper_transcribe_create_json (filter, ctx,
+            work_item->pts);
+        if (json_str) {
+          gst_whisper_transcribe_push_json (filter, json_str, work_item->pts);
+          g_free (json_str);
         }
       }
 
