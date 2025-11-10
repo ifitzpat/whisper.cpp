@@ -28,6 +28,7 @@
 #include "gstwhispertranscribe.h"
 #include <gst/gst.h>
 #include <gst/audio/audio.h>
+#include <whisper.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_whisper_transcribe_debug);
 #define GST_CAT_DEFAULT gst_whisper_transcribe_debug
@@ -444,6 +445,13 @@ gst_whisper_transcribe_init (GstWhisperTranscribe * filter)
   filter->step_duration_ms = 3000;     /* 3 seconds */
   filter->overlap_duration_ms = 200;   /* 200 ms */
 
+  /* Phase 4: Initialize managers */
+  filter->whisper_ctx = whisper_context_manager_new ();
+  filter->audio_buffer = NULL;  /* Created in setup when we know sample rate */
+  g_mutex_init (&filter->lock);
+  filter->model_loaded = FALSE;
+  filter->sample_rate = 0;
+
   GST_DEBUG_OBJECT (filter, "Initialized whispertranscribe element");
 }
 
@@ -459,6 +467,36 @@ gst_whisper_transcribe_set_property (GObject * object, guint prop_id,
       g_free (filter->model_path);
       filter->model_path = g_value_dup_string (value);
       GST_DEBUG_OBJECT (filter, "Model path set to: %s", filter->model_path);
+
+      /* Phase 4: Load model when path is set */
+      if (filter->model_path && filter->whisper_ctx) {
+        GError *error = NULL;
+        gboolean success = whisper_context_manager_load_model (
+            filter->whisper_ctx, filter->model_path, filter->use_gpu, &error);
+
+        if (success) {
+          g_mutex_lock (&filter->lock);
+          filter->model_loaded = TRUE;
+          g_mutex_unlock (&filter->lock);
+
+          GST_INFO_OBJECT (filter, "Model loaded successfully: %s", filter->model_path);
+          g_signal_emit (filter, gst_whisper_transcribe_signals[SIGNAL_MODEL_LOADED],
+              0, filter->model_path);
+        } else {
+          g_mutex_lock (&filter->lock);
+          filter->model_loaded = FALSE;
+          g_mutex_unlock (&filter->lock);
+
+          GST_ERROR_OBJECT (filter, "Failed to load model: %s",
+              error ? error->message : "Unknown error");
+          g_signal_emit (filter, gst_whisper_transcribe_signals[SIGNAL_MODEL_LOAD_FAILED],
+              0, error ? error->message : "Unknown error");
+
+          if (error) {
+            g_error_free (error);
+          }
+        }
+      }
       break;
     case PROP_LANGUAGE:
       g_free (filter->language);
@@ -607,6 +645,19 @@ gst_whisper_transcribe_finalize (GObject * object)
   g_free (filter->language);
   g_free (filter->initial_prompt);
 
+  /* Phase 4: Cleanup managers */
+  if (filter->whisper_ctx) {
+    whisper_context_manager_free (filter->whisper_ctx);
+    filter->whisper_ctx = NULL;
+  }
+
+  if (filter->audio_buffer) {
+    audio_buffer_manager_free (filter->audio_buffer);
+    filter->audio_buffer = NULL;
+  }
+
+  g_mutex_clear (&filter->lock);
+
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
@@ -622,7 +673,30 @@ gst_whisper_transcribe_setup (GstAudioFilter * filter,
       GST_AUDIO_INFO_CHANNELS (info),
       gst_audio_format_to_string (GST_AUDIO_INFO_FORMAT (info)));
 
-  /* TODO: Initialize whisper context, audio buffers, etc. in later phases */
+  /* Phase 4: Create audio buffer manager with configured parameters */
+  g_mutex_lock (&whisper->lock);
+
+  /* Clean up old buffer if it exists */
+  if (whisper->audio_buffer) {
+    audio_buffer_manager_free (whisper->audio_buffer);
+  }
+
+  /* Store sample rate for later use */
+  whisper->sample_rate = GST_AUDIO_INFO_RATE (info);
+
+  /* Create new audio buffer manager */
+  whisper->audio_buffer = audio_buffer_manager_new (
+      whisper->window_duration_ms,
+      whisper->step_duration_ms,
+      whisper->overlap_duration_ms,
+      whisper->sample_rate);
+
+  g_mutex_unlock (&whisper->lock);
+
+  GST_INFO_OBJECT (whisper, "Audio buffer manager created: "
+      "window=%dms, step=%dms, overlap=%dms, rate=%dHz",
+      whisper->window_duration_ms, whisper->step_duration_ms,
+      whisper->overlap_duration_ms, whisper->sample_rate);
 
   return TRUE;
 }
@@ -632,11 +706,127 @@ static GstFlowReturn
 gst_whisper_transcribe_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 {
   GstWhisperTranscribe *filter = GST_WHISPER_TRANSCRIBE (trans);
+  GstMapInfo map;
+  gfloat *audio_data;
+  gsize n_samples;
+  gint64 pts;
 
-  /* TODO: Actual audio processing will be implemented in later phases */
-  GST_DEBUG_OBJECT (filter, "Processing buffer of size %" G_GSIZE_FORMAT,
+  GST_LOG_OBJECT (filter, "Processing buffer of size %" G_GSIZE_FORMAT,
       gst_buffer_get_size (buf));
 
-  /* For now, just pass through */
+  /* Check if model is loaded */
+  g_mutex_lock (&filter->lock);
+  gboolean model_ready = filter->model_loaded;
+  g_mutex_unlock (&filter->lock);
+
+  if (!model_ready) {
+    GST_DEBUG_OBJECT (filter, "Model not loaded yet, skipping transcription");
+    return GST_FLOW_OK;
+  }
+
+  /* Check if audio buffer manager is ready */
+  if (!filter->audio_buffer) {
+    GST_WARNING_OBJECT (filter, "Audio buffer manager not initialized");
+    return GST_FLOW_OK;
+  }
+
+  /* Map the buffer to access audio data */
+  if (!gst_buffer_map (buf, &map, GST_MAP_READ)) {
+    GST_ERROR_OBJECT (filter, "Failed to map buffer");
+    return GST_FLOW_ERROR;
+  }
+
+  /* Convert to float samples (assuming F32LE format) */
+  audio_data = (gfloat *) map.data;
+  n_samples = map.size / sizeof (gfloat);
+  pts = GST_BUFFER_PTS (buf);
+
+  GST_LOG_OBJECT (filter, "Pushing %zu samples to buffer (PTS: %" GST_TIME_FORMAT ")",
+      n_samples, GST_TIME_ARGS (pts));
+
+  /* Phase 4: Push audio data to buffer manager */
+  audio_buffer_manager_push (filter->audio_buffer, audio_data, n_samples, pts);
+
+  /* Try to extract and transcribe windows */
+  gfloat *window_data = NULL;
+  gsize window_size = 0;
+  gint64 window_pts = 0;
+
+  while (audio_buffer_manager_get_window (filter->audio_buffer,
+          &window_data, &window_size, &window_pts)) {
+
+    GST_DEBUG_OBJECT (filter, "Transcribing window: %zu samples, PTS: %"
+        GST_TIME_FORMAT, window_size, GST_TIME_ARGS (window_pts));
+
+    /* Emit transcription started signal */
+    g_signal_emit (filter, gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_STARTED],
+        0, window_pts);
+
+    /* Phase 4: Perform transcription using whisper context manager */
+    GError *error = NULL;
+    struct whisper_full_params params = whisper_full_default_params (
+        WHISPER_SAMPLING_GREEDY);
+
+    /* Configure params from element properties */
+    params.n_threads = filter->n_threads;
+    params.language = filter->language && g_strcmp0 (filter->language, "auto") != 0
+        ? filter->language : NULL;
+    params.translate = filter->translate;
+    params.temperature = filter->temperature;
+    params.initial_prompt = filter->initial_prompt;
+
+    gboolean success = whisper_context_manager_transcribe (
+        filter->whisper_ctx, window_data, window_size, &params, &error);
+
+    if (success) {
+      /* Get the transcribed text from whisper context */
+      struct whisper_context *ctx = whisper_context_manager_get_context (
+          filter->whisper_ctx);
+
+      if (ctx) {
+        gint n_segments = whisper_full_n_segments (ctx);
+
+        for (gint i = 0; i < n_segments; i++) {
+          const gchar *text = whisper_full_get_segment_text (ctx, i);
+          gint64 t0 = whisper_full_get_segment_t0 (ctx, i);
+          gint64 t1 = whisper_full_get_segment_t1 (ctx, i);
+
+          /* Create GstStructure with segment data */
+          GstStructure *segment = gst_structure_new ("whisper-segment",
+              "text", G_TYPE_STRING, text,
+              "start-time", G_TYPE_INT64, t0 * 10000000LL,  /* Convert to ns */
+              "end-time", G_TYPE_INT64, t1 * 10000000LL,
+              "pts", G_TYPE_INT64, window_pts,
+              NULL);
+
+          GST_INFO_OBJECT (filter, "Segment %d: [%ld-%ld] %s", i, t0, t1, text);
+
+          /* Emit segment transcribed signal */
+          g_signal_emit (filter,
+              gst_whisper_transcribe_signals[SIGNAL_SEGMENT_TRANSCRIBED],
+              0, segment);
+
+          gst_structure_free (segment);
+        }
+      }
+
+      /* Emit transcription completed signal */
+      gint64 duration = window_size * GST_SECOND / filter->sample_rate;
+      g_signal_emit (filter,
+          gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_COMPLETED],
+          0, window_pts, duration);
+
+    } else {
+      GST_WARNING_OBJECT (filter, "Transcription failed: %s",
+          error ? error->message : "Unknown error");
+      if (error) {
+        g_error_free (error);
+      }
+    }
+  }
+
+  gst_buffer_unmap (buf, &map);
+
+  /* Pass through the buffer */
   return GST_FLOW_OK;
 }

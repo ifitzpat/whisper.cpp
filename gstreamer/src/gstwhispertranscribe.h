@@ -10,6 +10,8 @@
 
 #include <gst/gst.h>
 #include <gst/audio/gstaudiofilter.h>
+#include "whispercontextmanager.h"
+#include "audiobuffermanager.h"
 
 G_BEGIN_DECLS
 
@@ -61,6 +63,19 @@ struct _GstWhisperTranscribe {
   gint window_duration_ms;
   gint step_duration_ms;
   gint overlap_duration_ms;
+
+  /* Phase 2: Whisper context management */
+  WhisperContextManager *whisper_ctx;
+
+  /* Phase 3: Audio buffer management */
+  AudioBufferManager *audio_buffer;
+
+  /* Thread safety */
+  GMutex lock;
+
+  /* State tracking */
+  gboolean model_loaded;
+  gint sample_rate;
 };
 
 struct _GstWhisperTranscribeClass {
