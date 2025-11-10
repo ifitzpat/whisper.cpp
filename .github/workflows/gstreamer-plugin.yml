@@ -55,6 +55,7 @@ jobs:
             gstreamer1.0-plugins-bad \
             libjson-glib-dev \
             libunwind-dev \
+            guix \
             python3-pip
 
       - name: Build whisper.cpp core library
