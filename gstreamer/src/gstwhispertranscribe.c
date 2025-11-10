@@ -94,6 +94,12 @@ static GstFlowReturn gst_whisper_transcribe_transform_ip (GstBaseTransform * tra
 static gboolean gst_whisper_transcribe_start (GstBaseTransform * trans);
 static gboolean gst_whisper_transcribe_stop (GstBaseTransform * trans);
 
+/* Phase 7: Control pad method declarations */
+static gboolean gst_whisper_transcribe_sink_event (GstBaseTransform * trans,
+    GstEvent * event);
+static gboolean gst_whisper_transcribe_src_query (GstBaseTransform * trans,
+    GstQuery * query);
+
 /* Property enum */
 enum
 {
@@ -444,6 +450,10 @@ gst_whisper_transcribe_class_init (GstWhisperTranscribeClass * klass)
   /* Phase 9: State management */
   trans_class->start = GST_DEBUG_FUNCPTR (gst_whisper_transcribe_start);
   trans_class->stop = GST_DEBUG_FUNCPTR (gst_whisper_transcribe_stop);
+
+  /* Phase 7: Control pad - event and query handling */
+  trans_class->sink_event = GST_DEBUG_FUNCPTR (gst_whisper_transcribe_sink_event);
+  trans_class->src_query = GST_DEBUG_FUNCPTR (gst_whisper_transcribe_src_query);
 
   /* AudioFilter configuration */
   audio_filter_class->setup = GST_DEBUG_FUNCPTR (gst_whisper_transcribe_setup);
@@ -1239,4 +1249,158 @@ gst_whisper_transcribe_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 
   /* Pass through the buffer */
   return GST_FLOW_OK;
+}
+
+/* Phase 7: Sink event handler - handles events on the sink pad */
+static gboolean
+gst_whisper_transcribe_sink_event (GstBaseTransform * trans, GstEvent * event)
+{
+  GstWhisperTranscribe *filter = GST_WHISPER_TRANSCRIBE (trans);
+  gboolean ret = TRUE;
+
+  GST_LOG_OBJECT (filter, "Received %s event", GST_EVENT_TYPE_NAME (event));
+
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_FLUSH_START:
+      GST_DEBUG_OBJECT (filter, "Handling FLUSH_START event");
+      /* Stop worker thread from processing during flush */
+      g_mutex_lock (&filter->worker_lock);
+      g_mutex_unlock (&filter->worker_lock);
+      break;
+
+    case GST_EVENT_FLUSH_STOP:
+      GST_DEBUG_OBJECT (filter, "Handling FLUSH_STOP event");
+      /* Clear audio buffer on flush */
+      if (filter->audio_buffer) {
+        audio_buffer_manager_clear (filter->audio_buffer);
+        GST_DEBUG_OBJECT (filter, "Audio buffer cleared after flush");
+      }
+      /* Clear work queue */
+      if (filter->work_queue) {
+        WhisperWorkItem *work_item;
+        while ((work_item = g_async_queue_try_pop (filter->work_queue)) != NULL) {
+          g_free (work_item->audio_data);
+          g_free (work_item);
+        }
+        GST_DEBUG_OBJECT (filter, "Work queue cleared after flush");
+      }
+      break;
+
+    case GST_EVENT_EOS:
+      GST_DEBUG_OBJECT (filter, "Handling EOS event");
+      /* Allow remaining buffered audio to be processed */
+      /* The worker thread will finish processing queued items */
+      break;
+
+    case GST_EVENT_SEGMENT:
+    {
+      const GstSegment *segment;
+      gst_event_parse_segment (event, &segment);
+      GST_DEBUG_OBJECT (filter, "Received SEGMENT event: format=%s, "
+          "start=%" GST_TIME_FORMAT ", stop=%" GST_TIME_FORMAT,
+          gst_format_get_name (segment->format),
+          GST_TIME_ARGS (segment->start),
+          GST_TIME_ARGS (segment->stop));
+      break;
+    }
+
+    case GST_EVENT_CAPS:
+    {
+      GstCaps *caps;
+      gst_event_parse_caps (event, &caps);
+      GST_DEBUG_OBJECT (filter, "Received CAPS event: %" GST_PTR_FORMAT, caps);
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  /* Chain up to parent class to handle the event */
+  ret = GST_BASE_TRANSFORM_CLASS (gst_whisper_transcribe_parent_class)->sink_event (trans, event);
+
+  return ret;
+}
+
+/* Phase 7: Source query handler - handles queries on the source pad */
+static gboolean
+gst_whisper_transcribe_src_query (GstBaseTransform * trans, GstQuery * query)
+{
+  GstWhisperTranscribe *filter = GST_WHISPER_TRANSCRIBE (trans);
+  gboolean ret = TRUE;
+
+  GST_LOG_OBJECT (filter, "Received %s query", GST_QUERY_TYPE_NAME (query));
+
+  switch (GST_QUERY_TYPE (query)) {
+    case GST_QUERY_LATENCY:
+    {
+      GstClockTime min_latency, max_latency;
+      gboolean live;
+
+      /* Chain up to get upstream latency first */
+      ret = GST_BASE_TRANSFORM_CLASS (gst_whisper_transcribe_parent_class)->src_query (trans, query);
+
+      if (ret) {
+        gst_query_parse_latency (query, &live, &min_latency, &max_latency);
+
+        /* Add our processing latency (window duration) */
+        GstClockTime our_latency = filter->window_duration_ms * GST_MSECOND;
+        min_latency += our_latency;
+        if (max_latency != GST_CLOCK_TIME_NONE) {
+          max_latency += our_latency;
+        }
+
+        gst_query_set_latency (query, live, min_latency, max_latency);
+
+        GST_DEBUG_OBJECT (filter, "Latency query: live=%d, min=%" GST_TIME_FORMAT
+            ", max=%" GST_TIME_FORMAT " (added %dms)",
+            live, GST_TIME_ARGS (min_latency), GST_TIME_ARGS (max_latency),
+            filter->window_duration_ms);
+      }
+      break;
+    }
+
+    case GST_QUERY_POSITION:
+    {
+      GstFormat format;
+      gst_query_parse_position (query, &format, NULL);
+
+      if (format == GST_FORMAT_TIME) {
+        /* Query upstream for position */
+        ret = GST_BASE_TRANSFORM_CLASS (gst_whisper_transcribe_parent_class)->src_query (trans, query);
+
+        if (ret) {
+          gint64 position;
+          gst_query_parse_position (query, NULL, &position);
+          GST_LOG_OBJECT (filter, "Position query: %" GST_TIME_FORMAT,
+              GST_TIME_ARGS (position));
+        }
+      } else {
+        ret = FALSE;
+      }
+      break;
+    }
+
+    case GST_QUERY_DURATION:
+    {
+      /* Chain up to parent - we don't modify duration */
+      ret = GST_BASE_TRANSFORM_CLASS (gst_whisper_transcribe_parent_class)->src_query (trans, query);
+
+      if (ret) {
+        GstFormat format;
+        gint64 duration;
+        gst_query_parse_duration (query, &format, &duration);
+        GST_LOG_OBJECT (filter, "Duration query: format=%s, duration=%" GST_TIME_FORMAT,
+            gst_format_get_name (format), GST_TIME_ARGS (duration));
+      }
+      break;
+    }
+
+    default:
+      /* Chain up to parent class for other queries */
+      ret = GST_BASE_TRANSFORM_CLASS (gst_whisper_transcribe_parent_class)->src_query (trans, query);
+      break;
+  }
+
+  return ret;
 }
