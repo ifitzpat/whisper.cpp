@@ -43,6 +43,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            cmake \
             meson \
             ninja-build \
             pkg-config \
@@ -53,13 +54,15 @@ jobs:
             gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad \
             libjson-glib-dev \
+            libunwind-dev \
             python3-pip
 
       - name: Build whisper.cpp core library
         run: |
-          echo "Building whisper.cpp core library..."
-          make libwhisper.a -j$(nproc)
-          ls -la libwhisper.a
+          echo "Building whisper.cpp core library with CMake..."
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j$(nproc)
+          ls -la build/libwhisper.*
           echo "✓ Core library built successfully"
 
       - name: Configure GStreamer plugin with meson
@@ -69,7 +72,7 @@ jobs:
           meson setup builddir \
             --prefix=/usr \
             -Dtests=enabled \
-            -Dwhisper_lib_path=../
+            -Dwhisper_lib_path=../build
           echo "✓ Configuration complete"
 
       - name: Build GStreamer plugin
@@ -191,6 +194,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            cmake \
             python3-pip \
             pkg-config \
             libgstreamer1.0-dev \
@@ -203,12 +207,13 @@ jobs:
 
       - name: Build whisper.cpp core library
         run: |
-          make libwhisper.a -j$(nproc)
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j$(nproc)
 
       - name: Build GStreamer plugin
         working-directory: gstreamer
         run: |
-          ~/.local/bin/meson setup builddir -Dtests=enabled
+          ~/.local/bin/meson setup builddir -Dtests=enabled -Dwhisper_lib_path=../build
           ~/.local/bin/meson compile -C builddir
 
       - name: Test plugin
