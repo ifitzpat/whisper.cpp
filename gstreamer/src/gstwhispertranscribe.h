@@ -70,6 +70,13 @@ struct _GstWhisperTranscribe {
   /* Phase 3: Audio buffer management */
   AudioBufferManager *audio_buffer;
 
+  /* Phase 5: Worker thread for async processing */
+  GThread *worker_thread;
+  GAsyncQueue *work_queue;
+  gboolean worker_running;
+  GMutex worker_lock;
+  GCond worker_cond;
+
   /* Thread safety */
   GMutex lock;
 

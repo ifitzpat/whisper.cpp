@@ -33,6 +33,19 @@
 GST_DEBUG_CATEGORY_STATIC (gst_whisper_transcribe_debug);
 #define GST_CAT_DEFAULT gst_whisper_transcribe_debug
 
+/* Phase 5: Work item for async transcription */
+typedef struct _WhisperWorkItem {
+  gfloat *audio_data;
+  gsize n_samples;
+  gint64 pts;
+  GstWhisperTranscribe *filter;  /* Reference to element for signal emission */
+} WhisperWorkItem;
+
+/* Forward declarations for Phase 5 */
+static gpointer gst_whisper_transcribe_worker_thread (gpointer data);
+static void gst_whisper_transcribe_start_worker (GstWhisperTranscribe *filter);
+static void gst_whisper_transcribe_stop_worker (GstWhisperTranscribe *filter);
+
 /* Pad templates - minimal for now */
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE (
     "sink",
@@ -452,6 +465,13 @@ gst_whisper_transcribe_init (GstWhisperTranscribe * filter)
   filter->model_loaded = FALSE;
   filter->sample_rate = 0;
 
+  /* Phase 5: Initialize worker thread */
+  filter->worker_thread = NULL;
+  filter->work_queue = g_async_queue_new ();
+  filter->worker_running = FALSE;
+  g_mutex_init (&filter->worker_lock);
+  g_cond_init (&filter->worker_cond);
+
   GST_DEBUG_OBJECT (filter, "Initialized whispertranscribe element");
 }
 
@@ -482,6 +502,9 @@ gst_whisper_transcribe_set_property (GObject * object, guint prop_id,
           GST_INFO_OBJECT (filter, "Model loaded successfully: %s", filter->model_path);
           g_signal_emit (filter, gst_whisper_transcribe_signals[SIGNAL_MODEL_LOADED],
               0, filter->model_path);
+
+          /* Phase 5: Start worker thread */
+          gst_whisper_transcribe_start_worker (filter);
         } else {
           g_mutex_lock (&filter->lock);
           filter->model_loaded = FALSE;
@@ -645,6 +668,9 @@ gst_whisper_transcribe_finalize (GObject * object)
   g_free (filter->language);
   g_free (filter->initial_prompt);
 
+  /* Phase 5: Stop worker thread */
+  gst_whisper_transcribe_stop_worker (filter);
+
   /* Phase 4: Cleanup managers */
   if (filter->whisper_ctx) {
     whisper_context_manager_free (filter->whisper_ctx);
@@ -655,6 +681,14 @@ gst_whisper_transcribe_finalize (GObject * object)
     audio_buffer_manager_free (filter->audio_buffer);
     filter->audio_buffer = NULL;
   }
+
+  /* Phase 5: Cleanup worker resources */
+  if (filter->work_queue) {
+    g_async_queue_unref (filter->work_queue);
+    filter->work_queue = NULL;
+  }
+  g_mutex_clear (&filter->worker_lock);
+  g_cond_clear (&filter->worker_cond);
 
   g_mutex_clear (&filter->lock);
 
@@ -699,6 +733,164 @@ gst_whisper_transcribe_setup (GstAudioFilter * filter,
       whisper->overlap_duration_ms, whisper->sample_rate);
 
   return TRUE;
+}
+
+/* Phase 5: Worker thread function for async transcription */
+static gpointer
+gst_whisper_transcribe_worker_thread (gpointer data)
+{
+  GstWhisperTranscribe *filter = GST_WHISPER_TRANSCRIBE (data);
+  WhisperWorkItem *work_item;
+
+  GST_INFO_OBJECT (filter, "Worker thread started");
+
+  g_mutex_lock (&filter->worker_lock);
+  while (filter->worker_running) {
+    g_mutex_unlock (&filter->worker_lock);
+
+    /* Wait for work with timeout */
+    work_item = g_async_queue_timeout_pop (filter->work_queue, 100000); /* 100ms */
+
+    if (!work_item) {
+      g_mutex_lock (&filter->worker_lock);
+      continue;
+    }
+
+    GST_DEBUG_OBJECT (filter, "Worker processing window: %zu samples, PTS: %"
+        GST_TIME_FORMAT, work_item->n_samples, GST_TIME_ARGS (work_item->pts));
+
+    /* Emit transcription started signal */
+    g_signal_emit (filter, gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_STARTED],
+        0, work_item->pts);
+
+    /* Perform transcription */
+    GError *error = NULL;
+    struct whisper_full_params params = whisper_full_default_params (
+        WHISPER_SAMPLING_GREEDY);
+
+    /* Configure params from element properties */
+    params.n_threads = filter->n_threads;
+    params.language = filter->language && g_strcmp0 (filter->language, "auto") != 0
+        ? filter->language : NULL;
+    params.translate = filter->translate;
+    params.temperature = filter->temperature;
+    params.initial_prompt = filter->initial_prompt;
+
+    gboolean success = whisper_context_manager_transcribe (
+        filter->whisper_ctx, work_item->audio_data, work_item->n_samples,
+        &params, &error);
+
+    if (success) {
+      /* Get the transcribed text from whisper context */
+      struct whisper_context *ctx = whisper_context_manager_get_context (
+          filter->whisper_ctx);
+
+      if (ctx) {
+        gint n_segments = whisper_full_n_segments (ctx);
+
+        for (gint i = 0; i < n_segments; i++) {
+          const gchar *text = whisper_full_get_segment_text (ctx, i);
+          gint64 t0 = whisper_full_get_segment_t0 (ctx, i);
+          gint64 t1 = whisper_full_get_segment_t1 (ctx, i);
+
+          /* Create GstStructure with segment data */
+          GstStructure *segment = gst_structure_new ("whisper-segment",
+              "text", G_TYPE_STRING, text,
+              "start-time", G_TYPE_INT64, t0 * 10000000LL,  /* Convert to ns */
+              "end-time", G_TYPE_INT64, t1 * 10000000LL,
+              "pts", G_TYPE_INT64, work_item->pts,
+              NULL);
+
+          GST_INFO_OBJECT (filter, "Segment %d: [%ld-%ld] %s", i, t0, t1, text);
+
+          /* Emit segment transcribed signal */
+          g_signal_emit (filter,
+              gst_whisper_transcribe_signals[SIGNAL_SEGMENT_TRANSCRIBED],
+              0, segment);
+
+          gst_structure_free (segment);
+        }
+      }
+
+      /* Emit transcription completed signal */
+      gint64 duration = work_item->n_samples * GST_SECOND / filter->sample_rate;
+      g_signal_emit (filter,
+          gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_COMPLETED],
+          0, work_item->pts, duration);
+
+    } else {
+      GST_WARNING_OBJECT (filter, "Transcription failed: %s",
+          error ? error->message : "Unknown error");
+      if (error) {
+        g_error_free (error);
+      }
+    }
+
+    /* Free work item */
+    g_free (work_item->audio_data);
+    g_free (work_item);
+
+    g_mutex_lock (&filter->worker_lock);
+  }
+  g_mutex_unlock (&filter->worker_lock);
+
+  GST_INFO_OBJECT (filter, "Worker thread stopped");
+  return NULL;
+}
+
+/* Phase 5: Start worker thread */
+static void
+gst_whisper_transcribe_start_worker (GstWhisperTranscribe *filter)
+{
+  g_mutex_lock (&filter->worker_lock);
+
+  if (filter->worker_thread) {
+    GST_DEBUG_OBJECT (filter, "Worker thread already running");
+    g_mutex_unlock (&filter->worker_lock);
+    return;
+  }
+
+  filter->worker_running = TRUE;
+  filter->worker_thread = g_thread_new ("whisper-worker",
+      gst_whisper_transcribe_worker_thread, filter);
+
+  g_mutex_unlock (&filter->worker_lock);
+
+  GST_INFO_OBJECT (filter, "Worker thread started");
+}
+
+/* Phase 5: Stop worker thread */
+static void
+gst_whisper_transcribe_stop_worker (GstWhisperTranscribe *filter)
+{
+  GThread *thread;
+
+  g_mutex_lock (&filter->worker_lock);
+
+  if (!filter->worker_thread) {
+    g_mutex_unlock (&filter->worker_lock);
+    return;
+  }
+
+  GST_INFO_OBJECT (filter, "Stopping worker thread");
+
+  filter->worker_running = FALSE;
+  thread = filter->worker_thread;
+  filter->worker_thread = NULL;
+
+  g_mutex_unlock (&filter->worker_lock);
+
+  /* Wait for worker to finish */
+  g_thread_join (thread);
+
+  /* Drain remaining work items */
+  WhisperWorkItem *work_item;
+  while ((work_item = g_async_queue_try_pop (filter->work_queue)) != NULL) {
+    g_free (work_item->audio_data);
+    g_free (work_item);
+  }
+
+  GST_INFO_OBJECT (filter, "Worker thread stopped");
 }
 
 /* Transform in-place - process audio buffers */
@@ -747,7 +939,7 @@ gst_whisper_transcribe_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   /* Phase 4: Push audio data to buffer manager */
   audio_buffer_manager_push (filter->audio_buffer, audio_data, n_samples, pts);
 
-  /* Try to extract and transcribe windows */
+  /* Phase 5: Extract windows and queue for async transcription */
   gfloat *window_data = NULL;
   gsize window_size = 0;
   gint64 window_pts = 0;
@@ -755,74 +947,21 @@ gst_whisper_transcribe_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   while (audio_buffer_manager_get_window (filter->audio_buffer,
           &window_data, &window_size, &window_pts)) {
 
-    GST_DEBUG_OBJECT (filter, "Transcribing window: %zu samples, PTS: %"
+    GST_DEBUG_OBJECT (filter, "Queueing window for transcription: %zu samples, PTS: %"
         GST_TIME_FORMAT, window_size, GST_TIME_ARGS (window_pts));
 
-    /* Emit transcription started signal */
-    g_signal_emit (filter, gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_STARTED],
-        0, window_pts);
+    /* Create work item with copy of audio data */
+    WhisperWorkItem *work_item = g_new0 (WhisperWorkItem, 1);
+    work_item->audio_data = g_memdup2 (window_data, window_size * sizeof (gfloat));
+    work_item->n_samples = window_size;
+    work_item->pts = window_pts;
+    work_item->filter = filter;
 
-    /* Phase 4: Perform transcription using whisper context manager */
-    GError *error = NULL;
-    struct whisper_full_params params = whisper_full_default_params (
-        WHISPER_SAMPLING_GREEDY);
+    /* Push to async queue for worker thread to process */
+    g_async_queue_push (filter->work_queue, work_item);
 
-    /* Configure params from element properties */
-    params.n_threads = filter->n_threads;
-    params.language = filter->language && g_strcmp0 (filter->language, "auto") != 0
-        ? filter->language : NULL;
-    params.translate = filter->translate;
-    params.temperature = filter->temperature;
-    params.initial_prompt = filter->initial_prompt;
-
-    gboolean success = whisper_context_manager_transcribe (
-        filter->whisper_ctx, window_data, window_size, &params, &error);
-
-    if (success) {
-      /* Get the transcribed text from whisper context */
-      struct whisper_context *ctx = whisper_context_manager_get_context (
-          filter->whisper_ctx);
-
-      if (ctx) {
-        gint n_segments = whisper_full_n_segments (ctx);
-
-        for (gint i = 0; i < n_segments; i++) {
-          const gchar *text = whisper_full_get_segment_text (ctx, i);
-          gint64 t0 = whisper_full_get_segment_t0 (ctx, i);
-          gint64 t1 = whisper_full_get_segment_t1 (ctx, i);
-
-          /* Create GstStructure with segment data */
-          GstStructure *segment = gst_structure_new ("whisper-segment",
-              "text", G_TYPE_STRING, text,
-              "start-time", G_TYPE_INT64, t0 * 10000000LL,  /* Convert to ns */
-              "end-time", G_TYPE_INT64, t1 * 10000000LL,
-              "pts", G_TYPE_INT64, window_pts,
-              NULL);
-
-          GST_INFO_OBJECT (filter, "Segment %d: [%ld-%ld] %s", i, t0, t1, text);
-
-          /* Emit segment transcribed signal */
-          g_signal_emit (filter,
-              gst_whisper_transcribe_signals[SIGNAL_SEGMENT_TRANSCRIBED],
-              0, segment);
-
-          gst_structure_free (segment);
-        }
-      }
-
-      /* Emit transcription completed signal */
-      gint64 duration = window_size * GST_SECOND / filter->sample_rate;
-      g_signal_emit (filter,
-          gst_whisper_transcribe_signals[SIGNAL_TRANSCRIPTION_COMPLETED],
-          0, window_pts, duration);
-
-    } else {
-      GST_WARNING_OBJECT (filter, "Transcription failed: %s",
-          error ? error->message : "Unknown error");
-      if (error) {
-        g_error_free (error);
-      }
-    }
+    GST_LOG_OBJECT (filter, "Work item queued, queue length: %d",
+        g_async_queue_length (filter->work_queue));
   }
 
   gst_buffer_unmap (buf, &map);
