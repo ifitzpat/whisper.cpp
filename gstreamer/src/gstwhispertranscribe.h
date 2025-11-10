@@ -83,6 +83,9 @@ struct _GstWhisperTranscribe {
   /* State tracking */
   gboolean model_loaded;
   gint sample_rate;
+
+  /* Phase 6: Audio format info */
+  GstAudioInfo audio_info;
 };
 
 struct _GstWhisperTranscribeClass {

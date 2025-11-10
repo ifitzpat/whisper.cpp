@@ -46,6 +46,10 @@ static gpointer gst_whisper_transcribe_worker_thread (gpointer data);
 static void gst_whisper_transcribe_start_worker (GstWhisperTranscribe *filter);
 static void gst_whisper_transcribe_stop_worker (GstWhisperTranscribe *filter);
 
+/* Phase 6: Audio format conversion helpers */
+static gfloat * gst_whisper_transcribe_convert_audio (GstWhisperTranscribe *filter,
+    const guint8 *data, gsize size, gsize *out_samples);
+
 /* Pad templates - minimal for now */
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE (
     "sink",
@@ -695,6 +699,71 @@ gst_whisper_transcribe_finalize (GObject * object)
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
+/* Phase 6: Audio format conversion helper */
+static gfloat *
+gst_whisper_transcribe_convert_audio (GstWhisperTranscribe *filter,
+    const guint8 *data, gsize size, gsize *out_samples)
+{
+  GstAudioFormat format = GST_AUDIO_INFO_FORMAT (&filter->audio_info);
+  gint channels = GST_AUDIO_INFO_CHANNELS (&filter->audio_info);
+  gsize n_frames;
+  gfloat *converted = NULL;
+  gsize i, j;
+
+  if (format == GST_AUDIO_FORMAT_F32LE) {
+    /* Already float format */
+    n_frames = size / (sizeof (gfloat) * channels);
+    converted = g_new (gfloat, n_frames);
+
+    if (channels == 1) {
+      /* Mono - direct copy */
+      memcpy (converted, data, size);
+    } else {
+      /* Stereo or multi-channel - average to mono */
+      const gfloat *in = (const gfloat *) data;
+      for (i = 0; i < n_frames; i++) {
+        gfloat sum = 0.0f;
+        for (j = 0; j < channels; j++) {
+          sum += in[i * channels + j];
+        }
+        converted[i] = sum / channels;
+      }
+    }
+    *out_samples = n_frames;
+
+  } else if (format == GST_AUDIO_FORMAT_S16LE) {
+    /* S16LE - convert to float and average channels */
+    n_frames = size / (sizeof (gint16) * channels);
+    converted = g_new (gfloat, n_frames);
+    const gint16 *in = (const gint16 *) data;
+
+    if (channels == 1) {
+      /* Mono - convert to float */
+      for (i = 0; i < n_frames; i++) {
+        converted[i] = in[i] / 32768.0f;
+      }
+    } else {
+      /* Stereo or multi-channel - average to mono and convert */
+      for (i = 0; i < n_frames; i++) {
+        gfloat sum = 0.0f;
+        for (j = 0; j < channels; j++) {
+          sum += in[i * channels + j] / 32768.0f;
+        }
+        converted[i] = sum / channels;
+      }
+    }
+    *out_samples = n_frames;
+
+  } else {
+    GST_ERROR_OBJECT (filter, "Unsupported audio format: %s",
+        gst_audio_format_to_string (format));
+    *out_samples = 0;
+    return NULL;
+  }
+
+  return converted;
+}
+
 /* AudioFilter setup - called when audio format is negotiated */
 static gboolean
 gst_whisper_transcribe_setup (GstAudioFilter * filter,
@@ -706,6 +775,10 @@ gst_whisper_transcribe_setup (GstAudioFilter * filter,
       GST_AUDIO_INFO_RATE (info),
       GST_AUDIO_INFO_CHANNELS (info),
       gst_audio_format_to_string (GST_AUDIO_INFO_FORMAT (info)));
+
+  /* Phase 6: Store audio format info */
+  gst_audio_info_init (&whisper->audio_info);
+  gst_audio_info_copy (&whisper->audio_info, info);
 
   /* Phase 4: Create audio buffer manager with configured parameters */
   g_mutex_lock (&whisper->lock);
@@ -728,9 +801,11 @@ gst_whisper_transcribe_setup (GstAudioFilter * filter,
   g_mutex_unlock (&whisper->lock);
 
   GST_INFO_OBJECT (whisper, "Audio buffer manager created: "
-      "window=%dms, step=%dms, overlap=%dms, rate=%dHz",
+      "window=%dms, step=%dms, overlap=%dms, rate=%dHz, channels=%d, format=%s",
       whisper->window_duration_ms, whisper->step_duration_ms,
-      whisper->overlap_duration_ms, whisper->sample_rate);
+      whisper->overlap_duration_ms, whisper->sample_rate,
+      GST_AUDIO_INFO_CHANNELS (info),
+      gst_audio_format_to_string (GST_AUDIO_INFO_FORMAT (info)));
 
   return TRUE;
 }
@@ -928,9 +1003,16 @@ gst_whisper_transcribe_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     return GST_FLOW_ERROR;
   }
 
-  /* Convert to float samples (assuming F32LE format) */
-  audio_data = (gfloat *) map.data;
-  n_samples = map.size / sizeof (gfloat);
+  /* Phase 6: Convert audio to mono F32LE format */
+  audio_data = gst_whisper_transcribe_convert_audio (filter,
+      map.data, map.size, &n_samples);
+
+  if (!audio_data) {
+    GST_ERROR_OBJECT (filter, "Failed to convert audio format");
+    gst_buffer_unmap (buf, &map);
+    return GST_FLOW_ERROR;
+  }
+
   pts = GST_BUFFER_PTS (buf);
 
   GST_LOG_OBJECT (filter, "Pushing %zu samples to buffer (PTS: %" GST_TIME_FORMAT ")",
@@ -938,6 +1020,9 @@ gst_whisper_transcribe_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 
   /* Phase 4: Push audio data to buffer manager */
   audio_buffer_manager_push (filter->audio_buffer, audio_data, n_samples, pts);
+
+  /* Free converted audio data */
+  g_free (audio_data);
 
   /* Phase 5: Extract windows and queue for async transcription */
   gfloat *window_data = NULL;
